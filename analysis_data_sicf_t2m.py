@@ -4,11 +4,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 import os
-import shutil
 import glob
 
 # --- 1. Configuration des chemins et des données ---
 
+# **!!! IMPORTANT: CHANGE THIS PATH TO YOUR DATA DIRECTORY !!!**
 # Base path for the original, non-cleaned files (This path must contain all the CM61-LR-scen files)
 ORIGINAL_DATA_BASE_PATH = "C:\\Users\\clari\\Documents\\MA 2\\atm processes\\project\\"
 
@@ -32,8 +32,6 @@ def load_raw_variable(scenario, region, variable_name, base_path):
     """
     Loads a specific variable from the ORIGINAL (non-cleaned) file path.
     Returns the time series of the spatial mean of that variable across lat/lon.
-    If the variable is T2m or SICF, it will be 2D (time).
-    If the variable is OVAP or THETA, it will be 3D (time, vertical_level).
     """
     print(f"Loading RAW variable '{variable_name}' for {scenario.upper()} - {region.upper()}")
     
@@ -57,7 +55,7 @@ def load_raw_variable(scenario, region, variable_name, base_path):
                  continue
                  
             # Extract the variable, convert to Dataset (to keep metadata) and load into memory
-            ds_var = ds[variable_name].to_dataset().load()
+            ds_var = ds[variable_name].squeeze().to_dataset().load()
             datasets.append(ds_var)
             
         if not datasets:
@@ -66,19 +64,31 @@ def load_raw_variable(scenario, region, variable_name, base_path):
         # Concat and calculate the regional mean of the variable across lat/lon
         ds_full = xr.concat(datasets, dim=TIME_COORD_NAME)
         
+        # Determine dimensions to average over (lat/lon, but preserve vertical level if present)
+        mean_dims = [dim for dim in ds_full[variable_name].dims if dim in ('lat', 'lon')]
+        
         # Return the DataArray. If it has vertical levels, the mean over lat/lon will preserve them.
-        return ds_full[variable_name].mean(dim=('lat', 'lon'))
+        return ds_full[variable_name].mean(dim=mean_dims)
         
     except Exception as e:
         print(f"Error loading RAW variable '{variable_name}' for {scenario}-{region}: {e}")
         return None
 
 
-def calculate_regional_anomalies(ds_t2m_mean):
-    """Calculates the regional T2m anomaly based on the reference period."""
-    # ds_t2m_mean is already the regional mean (2D: time)
-    regional_ref = ds_t2m_mean.sel({TIME_COORD_NAME: slice(f'{REF_START}', f'{REF_END}')}).mean()
-    regional_anomaly = ds_t2m_mean - regional_ref
+def calculate_regional_anomalies(ds_mean_var):
+    """Calculates the regional anomaly based on the reference period."""
+    # ds_mean_var is already the regional mean (2D: time or time, vertical_level)
+    
+    # Calculate the mean over time if it has vertical levels, for the reference period mean.
+    # This ensures a single value is used for the reference, similar to T2m.
+    if len(ds_mean_var.dims) > 1 and 'vertical' in [d.lower() for d in ds_mean_var.dims]:
+        # Calculate the mean over all remaining dimensions (e.g., vertical level)
+        ds_mean_time_series = ds_mean_var.mean(dim=[dim for dim in ds_mean_var.dims if dim != TIME_COORD_NAME])
+    else:
+        ds_mean_time_series = ds_mean_var # Already a 1D time series
+
+    regional_ref = ds_mean_time_series.sel({TIME_COORD_NAME: slice(f'{REF_START}', f'{REF_END}')}).mean()
+    regional_anomaly = ds_mean_time_series - regional_ref
     return regional_anomaly
 
 # Define the exponential function for fitting
@@ -88,13 +98,12 @@ def exponential_func(t, a, b):
 
 def plot_t2m_anomalies(analysis_results):
     """
-    Plots the T2m temperature anomaly (6-Month Moving Average + Exponential Fit excluding boundaries).
+    Plots the T2m temperature anomaly (Moving Average + Exponential Fit).
     """
     plt.style.use('seaborn-v0_8-whitegrid')
     fig, ax = plt.subplots(figsize=(12, 7))
     
-    # NEW CONFIGURATION
-    MA_WINDOW_MONTHS = 12 # 6-month moving average
+    MA_WINDOW_MONTHS = 12 # 1-year moving average
     EXCLUDE_PERIOD_MONTHS = 6 # Exclude first/last 6 months for fitting
     
     print("\n--- Exponential Fit Results (Annual Growth Rate) ---")
@@ -102,10 +111,10 @@ def plot_t2m_anomalies(analysis_results):
     for region, results in analysis_results.items():
         for scenario, data in results.items():
             
-            # --- 1. SMOOTHED DATA (6-MONTH MOVING AVERAGE) ---
+            # --- 1. SMOOTHED DATA (12-MONTH MOVING AVERAGE) ---
             anom_raw = data['regional_anom']
-            # Apply 6-month rolling mean
-            anom_smoothed_6mo = anom_raw.rolling(
+            # Apply 12-month rolling mean
+            anom_smoothed_1yr = anom_raw.rolling(
                 {TIME_COORD_NAME: MA_WINDOW_MONTHS}, 
                 center=True, 
                 min_periods=1
@@ -113,34 +122,33 @@ def plot_t2m_anomalies(analysis_results):
             
             base_color = data['color']
             
-            # Plot 6-month smoothed data (thin line, high transparency)
+            # Plot 12-month smoothed data (thin line, high transparency)
             ax.plot(
-                anom_raw[TIME_COORD_NAME], anom_smoothed_6mo.values,
-                label=f'{region.capitalize()} ({scenario.upper()}) - 6-Month MA', 
+                anom_raw[TIME_COORD_NAME], anom_smoothed_1yr.values,
+                label=f'{region.capitalize()} ({scenario.upper()}) - 1-Year MA', 
                 color=base_color, 
                 linewidth=1.0,
                 alpha=0.6,
-                linestyle='-'
+                linestyle=':'
             )
             
             # --- 2. EXPONENTIAL REGRESSION (TREND) ---
             
             # 2a. Define the safe data subset for fitting
             N_total = len(anom_raw)
-            # Indices: Exclude first EXCLUDE_PERIOD_MONTHS and last EXCLUDE_PERIOD_MONTHS
             start_index = EXCLUDE_PERIOD_MONTHS
             end_index = N_total - EXCLUDE_PERIOD_MONTHS
             
             # Data used for fitting
-            anom_fit_data = anom_smoothed_6mo.values[start_index:end_index]
+            anom_fit_data = anom_smoothed_1yr.values[start_index:end_index]
             
             # Time array used for fitting (starts from 0, scaled to years)
             time_numeric = np.arange(N_total) / 12.0
             time_fit_data = time_numeric[start_index:end_index]
             
             try:
-                # Calculate the fit
-                popt, pcov = curve_fit(exponential_func, time_fit_data, anom_fit_data, p0=[0.1, 0.01], maxfev=5000)
+                # Initial guess (p0)
+                popt, pcov = curve_fit(exponential_func, time_fit_data, anom_fit_data, p0=[anom_fit_data[0] if anom_fit_data[0] != 0 else 0.01, 0.01], maxfev=5000)
                 b = popt[1] # Extract growth rate 'b'
                 
                 # Trend line values calculated over the entire period
@@ -149,30 +157,31 @@ def plot_t2m_anomalies(analysis_results):
                 # Plot the exponential trend line (Thick line)
                 ax.plot(
                     anom_raw[TIME_COORD_NAME], trend_line,
-                    label=f'{region.capitalize()} ({scenario.upper()}) - Exp. Trend (Growth Rate: {b*100:.2f}%/yr)', 
+                    label=f'{region.capitalize()} ({scenario.upper()}) - Exp. Trend (Growth Rate: {b*100:.3f}%/yr)', 
                     color=base_color, 
                     linewidth=3.0,
                     linestyle='-' if region == 'Arctic' else '--'
                 )
                 
                 # Print regression results
-                print(f"  {region.capitalize()} ({scenario.upper()}) - Exp. Growth Rate (b): {b:.6f} (Annual)")
+                print(f"  {region.capitalize()} ({scenario.upper()}) - Exp. Growth Rate (b): {b:.6f} (Annual)")
                 
             except RuntimeError:
-                print(f"  {region.capitalize()} ({scenario.upper()}): WARNING - Exponential fit failed to converge.")
+                print(f"  {region.capitalize()} ({scenario.upper()}): WARNING - Exponential fit failed to converge.")
             
-    ax.set_title(f"T2m Temperature Anomaly (2025-2094) - Smoothed Data and Exponential Trend")
-    ax.set_ylabel("T2m Anomaly (K)")
-    ax.set_xlabel("Date")
+    ax.set_title(f"T2m Temperature Anomaly (2025-2094) - Smoothed Data and Exponential Trend", fontsize=14)
+    ax.set_ylabel(r"T2m Anomaly ($\Delta T$ in K)", fontsize=12)
+    ax.set_xlabel("Date", fontsize=12)
     ax.axhline(0.0, color='black', linestyle=':', alpha=0.7)
-    ax.legend(loc='upper left')
+    ax.legend(loc='upper left', fontsize=10)
     plt.tight_layout()
     plt.show()
 
 
 def plot_arctic_vs_europe_ratio(analysis_results):
     """
-    Plots the Arctic vs. Europe Ratio: Delta T_Europe / Delta T_Arctic.
+    Plots the Europe Amplification Ratio (EAR): Delta T_Europe / Delta T_Arctic.
+    A value < 1.0 means the Arctic warms faster than Europe.
     """
     plt.style.use('seaborn-v0_8-whitegrid')
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -180,18 +189,26 @@ def plot_arctic_vs_europe_ratio(analysis_results):
     arctic_results = analysis_results['Arctic']
     europe_results = analysis_results['Europe']
     
+    # Smoothing window: 10 years (120 months) for the ratio plot
+    SMOOTHING_WINDOW_MONTHS = 120 
+    
     for scenario in SCENARIOS:
         # Raw regional anomalies
         anom_arctic = arctic_results[scenario.upper()]['regional_anom']
         anom_europe = europe_results[scenario.upper()]['regional_anom']
         
-        # Calculate the Ratio: Europe / Arctic
-        ratio_ap = np.where(anom_arctic != 0, anom_europe / anom_arctic, np.nan)
-        ratio_ap = xr.DataArray(ratio_ap, coords=anom_arctic.coords)
+        # Apply 12-month rolling mean to the anomalies before calculating the ratio
+        anom_arctic_smoothed = anom_arctic.rolling({TIME_COORD_NAME: 12}, center=True, min_periods=1).mean()
+        anom_europe_smoothed = anom_europe.rolling({TIME_COORD_NAME: 12}, center=True, min_periods=1).mean()
         
-        # Smoothing (10-year rolling mean = 120 months)
-        ratio_smoothed = ratio_ap.rolling(
-            {TIME_COORD_NAME: 120}, 
+        # Calculate Ratio on smoothed data
+        # Only calculate ratio when the Arctic anomaly magnitude is significant (e.g., > 0.01 K)
+        ratio_ear = np.where(np.abs(anom_arctic_smoothed) > 0.01, anom_europe_smoothed / anom_arctic_smoothed, np.nan)
+        ratio_ear = xr.DataArray(ratio_ear, coords=anom_arctic.coords)
+        
+        # Further smoothing for the ratio plot (10-year rolling mean = 120 months)
+        ratio_smoothed = ratio_ear.rolling(
+            {TIME_COORD_NAME: SMOOTHING_WINDOW_MONTHS}, 
             center=True, 
             min_periods=1
         ).mean() 
@@ -204,64 +221,47 @@ def plot_arctic_vs_europe_ratio(analysis_results):
             linewidth=2
         )
 
-    ax.set_title(f"Europe Warming Relative to Arctic Warming ({PERIOD_START}-{PERIOD_END})")
-    ax.set_ylabel(r"Relative Warming Ratio ($\Delta T_{Europe}/\Delta T_{Arctic}$)")
-    ax.set_xlabel("Date")
-    ax.axhline(1.0, color='black', linestyle=':', alpha=0.7, label='Ratio = 1 (Warming is Equal)')
-    
-    # We expect the ratio to be < 1.0, showing that Europe warms slower than the Arctic
+    ax.set_title(f"Europe Amplification Ratio (EAR): $\Delta T_{{Europe}} / \Delta T_{{Arctic}}$ ({PERIOD_START}-{PERIOD_END})", fontsize=14)
+    ax.set_ylabel(r"Europe Amplification Ratio", fontsize=12)
+    ax.set_xlabel("Date", fontsize=12)
+    ax.axhline(1.0, color='black', linestyle=':', alpha=0.8, label='Ratio = 1 (Equal Warming)')
     ax.axhline(0.5, color='gray', linestyle='--', alpha=0.5, label='Ratio = 0.5 (Europe warms half as fast)')
-    ax.set_ylim(0.0, 1.2) # Focus the y-axis to confirm the ratio < 1.0
-    ax.legend(loc='upper right')
+    ax.set_ylim(-1.0, 1.5)
+    ax.legend(loc='upper right', fontsize=10)
     plt.tight_layout()
     plt.show()
 
 
-# --- 4. Additional Variable Plots (Water Vapor and Potential Temperature) ---
-
-def plot_additional_anomalies(analysis_results_dict, variable_name, title, ylabel):
+def plot_sicf_evolution(sicf_analysis_results):
     """
-    Plots the anomaly of any additional variable (Water Vapor or Theta).
+    Plots the evolution of the Mean Sea Ice Fraction (SICF) in the Arctic.
     """
     plt.style.use('seaborn-v0_8-whitegrid')
-    fig, ax = plt.subplots(figsize=(10, 6))
-
-    for region, results in analysis_results_dict.items():
-        for scenario, data in results.items():
-            
-            # Apply 12-month rolling mean for smoothing
-            anom_smoothed_1yr = data['regional_anom'].rolling(
-                {TIME_COORD_NAME: 12}, 
-                center=True, 
-                min_periods=1
-            ).mean() 
-            
-            # Plot
-            anom_smoothed_1yr.plot(
-                ax=ax, 
-                label=f'{region.capitalize()} ({scenario.upper()}) - 1-Year MA', 
-                color=data['color'], 
-                linewidth=2,
-                linestyle='-' if region == 'Arctic' else '--'
-            )
-            
-    ax.set_title(f"{title} Anomaly ({PERIOD_START}-{PERIOD_END})")
-    ax.set_ylabel(ylabel)
-    ax.set_xlabel("Date")
-    ax.axhline(0.0, color='black', linestyle=':', alpha=0.7)
-    ax.legend(loc='upper left')
+    plt.figure(figsize=(10, 5))
+    
+    for scenario, data in sicf_analysis_results['Arctic'].items():
+        # Plot Annual Mean
+        data['regional_anom'].plot(
+            label=f'Mean SICF ({scenario}) - Annual Mean', 
+            color=data['color'], 
+            linewidth=2
+        )
+    
+    plt.title(f"Evolution of Mean Sea Ice Fraction (SICF) in the Arctic ({PERIOD_START}-{PERIOD_END})", fontsize=14)
+    plt.ylabel("Mean Sea Ice Fraction (0 to 1)", fontsize=12)
+    plt.xlabel("Year", fontsize=12)
+    plt.grid(True, linestyle=':', alpha=0.6)
+    plt.legend(fontsize=10)
     plt.tight_layout()
     plt.show()
 
-# --- 5. Main Execution Block ---
+# --- 3. Main Execution Block ---
 
 if __name__ == '__main__':
     
     # Initialization of results dictionaries
     t2m_analysis_results = {'Arctic': {}, 'Europe': {}}
     sicf_analysis_results = {'Arctic': {}, 'Europe': {}}
-    vapor_analysis_results = {'Arctic': {}, 'Europe': {}}
-    theta_analysis_results = {'Arctic': {}, 'Europe': {}}
     
     # --- Step 1: T2M Analysis (Primary Quantification) ---
     print("\n--- T2M TEMPERATURE ANALYSIS (Primary Quantification) ---")
@@ -285,113 +285,43 @@ if __name__ == '__main__':
             }
             
             # --- DEBUGGING T2M (End anomalies) ---
-            end_index = -1
-            regional_end = regional_anom.isel({TIME_COORD_NAME: end_index}).item()
-            print(f"  --- DEBUG ({scenario.upper()}-{region.upper()}) ---")
-            print(f"  Regional Anomaly (Start): {regional_anom[0].item():.4f} K")
-            print(f"  Regional Anomaly (End): {regional_end:.4f} K")
-            print("  --------------------------------------")
+            regional_end = regional_anom.isel({TIME_COORD_NAME: -1}).item()
+            print(f"  Final Anomaly ({scenario.upper()}-{region.upper()}): {regional_end:.4f} K")
 
-    # Final preparation for AP Ratio: copy Arctic anomaly to Global Anom field
-    for scenario in SCENARIOS:
-        if 'Arctic' in t2m_analysis_results and scenario.upper() in t2m_analysis_results['Arctic']:
-            arctic_anom = t2m_analysis_results['Arctic'][scenario.upper()]['regional_anom']
-            
-            # Assign Arctic anomaly as the denominator (global_anom) for all regions
-            t2m_analysis_results['Arctic'][scenario.upper()]['global_anom'] = arctic_anom
-            if 'Europe' in t2m_analysis_results and scenario.upper() in t2m_analysis_results['Europe']:
-                 t2m_analysis_results['Europe'][scenario.upper()]['global_anom'] = arctic_anom
-    
-    # --- Step 2: Plot T2m Anomaly + Exponential Trend (Focus on Magnitude) ---
-    plot_t2m_anomalies(t2m_analysis_results)
-    
-    # --- Step 3: Plot Arctic vs Europe Ratio (Focus on Relative Amplification) ---
-    plot_arctic_vs_europe_ratio(t2m_analysis_results)
-
-
-    # --- Step 4: Water Vapor ('ovap') and Potential Temperature ('theta') Analysis ---
-    print("\n--- Atmospheric Feedback Analysis (RAW files) ---")
-    
-    VAPOR_VARIABLE = 'ovap' 
-    THETA_VARIABLE = 'theta'
-    
-    for scenario in SCENARIOS:
-        for region in REGIONS:
-            
-            # --- A. VAPOR ANALYSIS ---
-            ovap_mean = load_raw_variable(scenario, region, VAPOR_VARIABLE, ORIGINAL_DATA_BASE_PATH)
-            
-            if ovap_mean is not None:
-                # Calculate anomaly
-                ovap_mean_time_series = ovap_mean.mean(dim=[dim for dim in ovap_mean.dims if dim != TIME_COORD_NAME])
-                ovap_ref = ovap_mean_time_series.sel({TIME_COORD_NAME: slice(f'{REF_START}', f'{REF_END}')}).mean()
-                ovap_anomaly = ovap_mean_time_series - ovap_ref
-                
-                vapor_analysis_results[region.capitalize()][scenario.upper()] = {
-                    'regional_anom': ovap_anomaly,
-                    'color': SCENARIO_COLORS[scenario]
-                }
-            
-            # --- B. THETA ANALYSIS ---
-            theta_mean = load_raw_variable(scenario, region, THETA_VARIABLE, ORIGINAL_DATA_BASE_PATH)
-            
-            if theta_mean is not None:
-                # Calculate anomaly
-                theta_mean_time_series = theta_mean.mean(dim=[dim for dim in theta_mean.dims if dim != TIME_COORD_NAME])
-                theta_ref = theta_mean_time_series.sel({TIME_COORD_NAME: slice(f'{REF_START}', f'{REF_END}')}).mean()
-                theta_anomaly = theta_mean_time_series - theta_ref
-                
-                theta_analysis_results[region.capitalize()][scenario.upper()] = {
-                    'regional_anom': theta_anomaly,
-                    'color': SCENARIO_COLORS[scenario]
-                }
-
-    # Plot Water Vapor Analysis (only if data was successfully loaded)
-    if any(vapor_analysis_results['Arctic']) or any(vapor_analysis_results['Europe']):
-        plot_additional_anomalies(vapor_analysis_results, VAPOR_VARIABLE, "Specific Humidity (Water Vapor) Anomaly", "Specific Humidity Anomaly (kg/kg)")
+    # Check if we have enough T2m data to proceed
+    if 'Arctic' not in t2m_analysis_results or 'Europe' not in t2m_analysis_results or not t2m_analysis_results['Arctic'] or not t2m_analysis_results['Europe']:
+         print("\nFATAL ERROR: Insufficient T2m data loaded for Arctic and/or Europe. Check paths and files.")
     else:
-        print("Skipping Water Vapor analysis: Variable 'ovap' not found in original files.")
-
-    # Plot Potential Temperature Analysis (only if data was successfully loaded)
-    if any(theta_analysis_results['Arctic']) or any(theta_analysis_results['Europe']):
-        plot_additional_anomalies(theta_analysis_results, THETA_VARIABLE, "Potential Air Temperature Anomaly", "Potential Temperature Anomaly (K)")
-    else:
-        print("Skipping Potential Temperature analysis: Variable 'theta' not found in original files.")
+        # --- Step 2: Plot T2m Anomaly + Exponential Trend (Focus on Magnitude) ---
+        plot_t2m_anomalies(t2m_analysis_results)
+        
+        # --- Step 3: Plot Arctic vs Europe Ratio (Focus on Relative Amplification) ---
+        plot_arctic_vs_europe_ratio(t2m_analysis_results)
 
 
-    # --- Step 5: Sea Ice Evolution (sicf) ---
+    # --- Step 4: Sea Ice Evolution (sicf) ---
 
     print("\n--- Sea Ice Fraction (sicf) Analysis ---")
     
     for scenario in SCENARIOS:
-        # Load mean SICF time series
+        # SICF is only relevant for the Arctic
         ds_sicf_mean = load_raw_variable(scenario, 'arctic', 'sicf', ORIGINAL_DATA_BASE_PATH)
         
         if ds_sicf_mean is None:
             continue
         
-        # Calculate annual mean SICF
+        # Calculate annual mean SICF for a clearer trend plot
+        # Note: SICF is plotted as its absolute value (0-1), not an anomaly relative to the start
         sicf_annual = ds_sicf_mean.resample({TIME_COORD_NAME: 'YE'}).mean()
         
         sicf_analysis_results['Arctic'][scenario.upper()] = {
-            'regional_anom': sicf_annual, # SICF is plotted directly, not as an anomaly relative to the start
+            'regional_anom': sicf_annual,
             'color': SCENARIO_COLORS[scenario]
         }
 
-
-    if any(sicf_analysis_results['Arctic']):
-        plt.figure(figsize=(10, 5))
-        
-        for scenario, data in sicf_analysis_results['Arctic'].items():
-            data['regional_anom'].plot(label=f'Mean SICF ({scenario})', color=data['color'], linewidth=2)
-        
-        plt.title(f"Evolution of Mean Sea Ice Fraction (SICF) in the Arctic ({PERIOD_START}-{PERIOD_END})")
-        plt.ylabel("Mean Sea Ice Fraction")
-        plt.xlabel("Year")
-        plt.grid(True, linestyle=':', alpha=0.6)
-        plt.legend()
-        plt.show()
+    if any(sicf_analysis_results['Arctic'].values()):
+        plot_sicf_evolution(sicf_analysis_results)
     else:
         print("Skipping SICF analysis due to loading errors.")
 
-    print("\nFinal analysis script executed with Arctic vs Europe ratio and added vapor/theta analysis.")
+    print("\nFinal analysis script executed, focusing on T2m, Amplification Ratio, and Sea Ice Fraction.")
