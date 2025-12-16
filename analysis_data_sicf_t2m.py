@@ -20,13 +20,21 @@ PERIOD_END = 2094
 REF_START = 2025 
 REF_END = 2034 
 
+# SCENARIO PLOTTING START YEAR (New requested start point for SICF: 2040)
+PLOT_START_YEAR_SICF = 2040
+
+# --- GLOBAL UNCERTAINTY SETTINGS (Used for EAR and SICF) ---
+# Use 5 years for standard deviation for consistency
+STDDEV_WINDOW_MONTHS_GLOBAL = 60 # 5 years
+STDDEV_WINDOW_YEARS_GLOBAL = 5   # 5 years
+
 # Scenario and region definitions
 REGIONS = ['arctic', 'europe']
 SCENARIOS = ['ssp245', 'ssp585']
 SCENARIO_COLORS = {'ssp245': 'blue', 'ssp585': 'red'}
 TIME_COORD_NAME = 'time_counter' 
 
-# --- 2. Utility Functions ---
+# --- 2. Utility Functions (Unchanged) ---
 
 def load_raw_variable(scenario, region, variable_name, base_path):
     """
@@ -89,7 +97,7 @@ def exponential_func(t, a, b):
 def plot_t2m_anomalies(analysis_results):
     """
     Plots the T2m temperature anomaly (1-Year MA and Exponential Fit).
-    Legends in English. Variability band removed.
+    Uncertainty band removed as requested.
     """
     plt.style.use('seaborn-v0_8-whitegrid')
     fig, ax = plt.subplots(figsize=(12, 7))
@@ -178,8 +186,8 @@ def plot_t2m_anomalies(analysis_results):
 
 def plot_arctic_vs_europe_ratio(analysis_results):
     """
-    Plots the Europe Amplification Ratio (EAR) with 10-Year MA Trend (solid line) 
-    and the uncertainty band (1-year Std Dev). Legends are in English.
+    Plots the Europe Amplification Ratio (EAR) with 10-Year MA Trend (thinner solid line) 
+    and the uncertainty band (5-year Std Dev for consistency). Legends are in English.
     """
     plt.style.use('seaborn-v0_8-whitegrid')
     fig, ax = plt.subplots(figsize=(10, 6))
@@ -190,7 +198,7 @@ def plot_arctic_vs_europe_ratio(analysis_results):
     # Smoothing Windows
     MA_WINDOW_MONTHS_ANOM = 12 # 1 year for smoothing anomalies
     MA_WINDOW_MONTHS_ROBUST = 120 # 10 years for the central tendency (Trend line)
-    STDDEV_WINDOW_MONTHS = 12 # 1 year for the standard deviation (Uncertainty)
+    STDDEV_WINDOW_MONTHS = STDDEV_WINDOW_MONTHS_GLOBAL # 5 years (Consistent uncertainty)
 
     # Months to exclude (Ref + half of the Robust MA window)
     EXCLUDE_MONTHS_START = (REF_END - REF_START + 1) * 12 + int(MA_WINDOW_MONTHS_ROBUST / 2)
@@ -223,7 +231,7 @@ def plot_arctic_vs_europe_ratio(analysis_results):
             min_periods=min_periods_robust
         ).mean() 
         
-        # 4. Calculate Uncertainty (1-year Moving Standard Deviation on the 1-year smoothed ratio)
+        # 4. Calculate Uncertainty (5-year Moving Standard Deviation on the 1-year smoothed ratio)
         ratio_std_dev = ratio_ear_variability.rolling(
              {TIME_COORD_NAME: STDDEV_WINDOW_MONTHS}, 
              center=True, 
@@ -255,7 +263,7 @@ def plot_arctic_vs_europe_ratio(analysis_results):
             ratio_upper_bound.values,
             color=base_color,
             alpha=0.3,
-            label=f'EAR ({scenario.upper()}) - $\pm 1 \sigma$ (1 yr Variability)'
+            label=f'EAR ({scenario.upper()}) - $\pm 1 \sigma$ (5 yr Variability)'
         )
         
         # Central Trend Line (10-Year MA - Solid, thinner line)
@@ -282,43 +290,56 @@ def plot_arctic_vs_europe_ratio(analysis_results):
 
 def plot_sicf_evolution(sicf_analysis_results):
     """
-    Plots the evolution of the Mean Sea Ice Fraction (SICF) in the Arctic.
-    Uncertainty band removed as requested. Legends are in English.
+    Plots the evolution of the Mean Sea Ice Fraction (SICF) in the Arctic 
+    from 2040 to 2094, with a 5-year Std Dev band for robust uncertainty (consistent).
     """
     plt.style.use('seaborn-v0_8-whitegrid')
     plt.figure(figsize=(10, 5))
     
-    start_plot_year = REF_END + 1 # 2035
-    
-    # We still need these variables for filtering purposes, but they won't be plotted as a band.
-    STDDEV_WINDOW_YEARS = 1 
-    min_periods_std_year = max(1, int(STDDEV_WINDOW_YEARS/2))
+    start_plot_year = PLOT_START_YEAR_SICF # 2040
+    STDDEV_WINDOW_YEARS = STDDEV_WINDOW_YEARS_GLOBAL # 5 years (Consistent uncertainty)
 
+    # Correction: Ensure min_periods is at least 1
+    min_periods_std_year = max(1, int(STDDEV_WINDOW_YEARS/2))
 
     for scenario, data in sicf_analysis_results['Arctic'].items():
         sicf_annual = data['regional_anom']
         
-        # 1. Calculate 1-year mobile standard deviation (used here only for determining valid indices)
+        # 1. Calculate 5-year mobile standard deviation
         sicf_std_dev = sicf_annual.rolling(
             {TIME_COORD_NAME: STDDEV_WINDOW_YEARS}, 
             center=True, 
             min_periods=min_periods_std_year
         ).std()
         
-        # 2. Filtering (Excluding reference period + edges)
+        # 2. Filtering (Slicing to start at 2040, and excluding edge effects)
         sicf_annual_plot = sicf_annual.sel({TIME_COORD_NAME: slice(f'{start_plot_year}', None)})
         sicf_std_dev_plot = sicf_std_dev.sel({TIME_COORD_NAME: slice(f'{start_plot_year}', None)})
         
-        # Exclude points where standard deviation is NaN (i.e., edge effects)
+        # Filter where the standard deviation is not NaN (i.e., filter edge effects)
         valid_indices = ~np.isnan(sicf_std_dev_plot.values)
         
         sicf_plot = sicf_annual_plot.values[valid_indices]
         sicf_time = sicf_annual_plot[TIME_COORD_NAME].values[valid_indices]
+        std_dev = sicf_std_dev_plot.values[valid_indices]
+        
+        sicf_upper_bound = sicf_plot + std_dev
+        sicf_lower_bound = sicf_plot - std_dev
 
         # 3. PLOTTING
         base_color = data['color']
         
-        # Main line (Annual Mean) - ONLY the line is plotted
+        # Uncertainty Band (± 1 Std Dev)
+        plt.fill_between(
+            sicf_time,
+            sicf_lower_bound,
+            sicf_upper_bound,
+            color=base_color,
+            alpha=0.2,
+            label=f'SICF ({scenario.upper()}) - $\pm 1 \sigma$ (5 yr Variability)'
+        )
+        
+        # Main line (Annual Mean)
         plt.plot(
             sicf_time, sicf_plot,
             label=f'Mean SICF ({scenario.upper()}) - Annual Mean', 
@@ -331,7 +352,7 @@ def plot_sicf_evolution(sicf_analysis_results):
     plt.ylabel("Mean Sea Ice Fraction (0 to 1)", fontsize=12)
     plt.xlabel("Year", fontsize=12)
     plt.grid(True, linestyle=':', alpha=0.6)
-    plt.legend(fontsize=10)
+    plt.legend(loc='lower left', fontsize=10) 
     plt.tight_layout()
     plt.show()
 
